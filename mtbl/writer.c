@@ -24,6 +24,7 @@ struct mtbl_writer_options {
 	int				compression_level;
 	size_t				block_size;
 	size_t				block_restart_interval;
+	size_t				thread_count;
 };
 
 struct mtbl_writer {
@@ -59,6 +60,7 @@ mtbl_writer_options_init(void)
 	opt->compression_level = DEFAULT_COMPRESSION_LEVEL;
 	opt->block_size = DEFAULT_BLOCK_SIZE;
 	opt->block_restart_interval = DEFAULT_BLOCK_RESTART_INTERVAL;
+	opt->thread_count = DEFAULT_WRITER_THREAD_COUNT;
 	return (opt);
 }
 
@@ -108,6 +110,13 @@ mtbl_writer_options_set_block_restart_interval(struct mtbl_writer_options *opt,
 	opt->block_restart_interval = block_restart_interval;
 }
 
+void
+mtbl_writer_options_set_thread_count(struct mtbl_writer_options *opt,
+					  int thread_count)
+{
+	opt->thread_count = thread_count;
+}
+
 struct mtbl_writer *
 mtbl_writer_init_fd(int orig_fd, const struct mtbl_writer_options *opt)
 {
@@ -119,8 +128,10 @@ mtbl_writer_init_fd(int orig_fd, const struct mtbl_writer_options *opt)
 	w = my_calloc(1, sizeof(*w));
 	if (opt == NULL) {
 		w->opt.compression_type = DEFAULT_COMPRESSION_TYPE;
+		w->opt.compression_level = DEFAULT_COMPRESSION_LEVEL;
 		w->opt.block_size = DEFAULT_BLOCK_SIZE;
 		w->opt.block_restart_interval = DEFAULT_BLOCK_RESTART_INTERVAL;
+		w->opt.thread_count = DEFAULT_WRITER_THREAD_COUNT;
 	} else {
 		memcpy(&w->opt, opt, sizeof(*opt));
 	}

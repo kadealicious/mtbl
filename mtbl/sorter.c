@@ -48,6 +48,7 @@ struct mtbl_sorter_options {
 	char				*tmp_dname;
 	mtbl_merge_func			merge;
 	void				*merge_clos;
+	size_t				thread_count;
 };
 
 struct mtbl_sorter {
@@ -65,6 +66,7 @@ mtbl_sorter_options_init(void)
 	struct mtbl_sorter_options *opt;
 	opt = my_calloc(1, sizeof(*opt));
 	opt->max_memory = DEFAULT_SORTER_MEMORY;
+	opt->thread_count = DEFAULT_SORTER_THREAD_COUNT;
 	mtbl_sorter_options_set_temp_dir(opt, DEFAULT_SORTER_TEMP_DIR);
 	return (opt);
 }
@@ -104,6 +106,12 @@ mtbl_sorter_options_set_max_memory(struct mtbl_sorter_options *opt,
 	opt->max_memory = max_memory;
 }
 
+void mtbl_sorter_options_set_thread_count(struct mtbl_sorter_options *opt, 
+					size_t thread_count)
+{
+	opt->thread_count = thread_count;
+}
+
 struct mtbl_sorter *
 mtbl_sorter_init(const struct mtbl_sorter_options *opt)
 {
@@ -113,6 +121,8 @@ mtbl_sorter_init(const struct mtbl_sorter_options *opt)
 	if (opt != NULL) {
 		memcpy(&s->opt, opt, sizeof(*opt));
 		s->opt.tmp_dname = strdup(opt->tmp_dname);
+	} else {
+		s->opt.thread_count = DEFAULT_SORTER_THREAD_COUNT;
 	}
 	s->vec = entry_vec_init(INITIAL_SORTER_VEC_SIZE);
 	s->chunks = chunk_vec_init(1);
