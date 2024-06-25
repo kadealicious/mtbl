@@ -107,7 +107,7 @@ mtbl_sorter_options_set_max_memory(struct mtbl_sorter_options *opt,
 }
 
 void mtbl_sorter_options_set_thread_count(struct mtbl_sorter_options *opt, 
-					size_t thread_count)
+					  size_t thread_count)
 {
 	opt->thread_count = thread_count;
 }

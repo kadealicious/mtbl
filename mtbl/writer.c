@@ -17,6 +17,9 @@
 #include "mtbl-private.h"
 #include "bytes.h"
 
+#include <pthread.h>
+#include "threadq.h"
+
 #include "libmy/ubuf.h"
 
 struct mtbl_writer_options {
@@ -34,6 +37,12 @@ struct mtbl_writer {
 	struct block_builder		*index;
 
 	struct mtbl_writer_options	opt;
+
+	// Compression threads; see thread_count in mtbl_writer_options.
+	size_t				open_thread_count;
+	pthread_t			writer_thread;
+	struct threadq*			ready_threads;
+	struct threadq*			running_threads;
 
 	ubuf				*last_key;
 	uint64_t			last_offset;
@@ -112,7 +121,7 @@ mtbl_writer_options_set_block_restart_interval(struct mtbl_writer_options *opt,
 
 void
 mtbl_writer_options_set_thread_count(struct mtbl_writer_options *opt,
-					  int thread_count)
+				     size_t thread_count)
 {
 	opt->thread_count = thread_count;
 }
@@ -146,6 +155,18 @@ mtbl_writer_init_fd(int orig_fd, const struct mtbl_writer_options *opt)
 	w->m.data_block_size = w->opt.block_size;
 	w->data = block_builder_init(w->opt.block_restart_interval);
 	w->index = block_builder_init(w->opt.block_restart_interval);
+
+	// Create running & ready thread queues for compression.
+	w->ready_threads = threadq_init();
+	w->running_threads = threadq_init();
+	for (size_t i = 0; i < opt->thread_count; i++) {
+		struct threadq_worker* wrk = threadq_worker_init(mtbl_writer_threadq_worker);
+		threadq_add(w->ready_threads, wrk);
+		w->open_thread_count++;
+	}
+	
+	pthread_create(&w->writer_thread, NULL, mtbl_writer_threadq_writer, w);
+
 	return (w);
 }
 
@@ -166,17 +187,18 @@ mtbl_writer_init(const char *fname, const struct mtbl_writer_options *opt)
 void
 mtbl_writer_destroy(struct mtbl_writer **w)
 {
-	if (*w != NULL) {
-		if (!(*w)->closed) {
-			_mtbl_writer_finish(*w);
-			close((*w)->fd);
-		}
-		block_builder_destroy(&((*w)->data));
-		block_builder_destroy(&((*w)->index));
-		ubuf_destroy(&(*w)->last_key);
-		free(*w);
-		*w = NULL;
+	if (*w == NULL) return;
+
+	if (!(*w)->closed) {
+		_mtbl_writer_finish(*w);
+		close((*w)->fd);
 	}
+
+	block_builder_destroy(&((*w)->data));
+	block_builder_destroy(&((*w)->index));
+	ubuf_destroy(&(*w)->last_key);
+	free(*w);
+	*w = NULL;
 }
 
 mtbl_res
@@ -223,6 +245,84 @@ mtbl_writer_add(struct mtbl_writer *w,
 	w->m.bytes_values += len_val;
 	block_builder_add(w->data, key, len_key, val, len_val);
 	return (mtbl_res_success);
+}
+
+void *
+mtbl_writer_threadq_worker(void *arg)
+{
+	struct threadq_worker *wrk = arg;
+	mtbl_threadq_job *job;
+	mtbl_threadq_result *r;
+
+	/* If we ever receive work == NULL, that means the shutdown signal 
+	 * was passed to that thread (and there is no more work to be done). */
+	while ((job = threadq_worker_recv_work(wrk)) != NULL) {
+		if ((void *)job == THREADQ_SHUTDOWN) {
+			threadq_worker_send_result(wrk, NULL);
+			continue;
+		}
+
+		/* Copy data block from job to result, then compress the block 
+		 * in result.  Finally, send the compressed block back to the 
+		 * worker thread and dispose of the job block.  This result can 
+		 * later be retrieved by calling threadq_worker_recv_result() 
+		 * on this same worker thread. */
+		r = calloc(1, sizeof(*r));
+		
+		printf("Compressing...\n");
+
+		threadq_worker_send_result(wrk, r);
+		free(job);
+	}
+
+	return NULL;
+}
+
+void *
+mtbl_writer_threadq_writer(void *arg)
+{
+	struct mtbl_writer *wr = arg;
+
+	while (true) {
+
+		// Retrieve the next compressed block to be written to disk.
+		struct threadq_worker *wrk = threadq_next(wr->running_threads);
+		mtbl_threadq_result *r = threadq_worker_recv_result(wrk);
+		threadq_add(wr->ready_threads, wrk);
+
+		// If the work result is NULL, we have no writing to do.
+		if (r == NULL) {
+			break;
+		}
+
+		printf("Writing...\n");
+		free(r);
+	}
+
+	return NULL;
+}
+
+void
+mtbl_writer_destroy_threadq(struct mtbl_writer* w)
+{
+	if (w == NULL) return;
+	
+	// Get the next available ready thread and send it the shutdown signal.
+	struct threadq_worker* wrk_shutdown = threadq_next(w->ready_threads);
+	threadq_worker_send_work(wrk_shutdown, THREADQ_SHUTDOWN);
+
+	pthread_join(w->writer_thread, NULL);
+	
+	// Close all ready threads (running threads will eventually become ready).
+	while (w->open_thread_count > 0) {
+		struct threadq_worker* wrk = threadq_next(w->ready_threads);
+		threadq_worker_join(wrk);
+		threadq_worker_destroy(&wrk);
+		w->open_thread_count--;
+	}
+
+	threadq_destroy(&w->ready_threads);
+	threadq_destroy(&w->running_threads);
 }
 
 static void

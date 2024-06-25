@@ -253,6 +253,11 @@ mtbl_writer_options_set_block_restart_interval(
 	struct mtbl_writer_options *,
 	size_t);
 
+void
+mtbl_writer_options_set_thread_count(
+	struct mtbl_writer_options *,
+	size_t);
+
 /* reader */
 
 struct mtbl_reader *
@@ -463,6 +468,11 @@ mtbl_sorter_options_set_temp_dir(
 
 void
 mtbl_sorter_options_set_max_memory(
+	struct mtbl_sorter_options *,
+	size_t);
+
+void
+mtbl_sorter_options_set_thread_count(
 	struct mtbl_sorter_options *,
 	size_t);
 

@@ -65,6 +65,9 @@ struct block;
 struct block_builder;
 struct block_iter;
 
+typedef void* mtbl_threadq_job;
+typedef void* mtbl_threadq_result;
+
 /* block */
 
 struct block *block_init(uint8_t *data, size_t size, bool needs_free);
@@ -96,6 +99,10 @@ void block_builder_add(struct block_builder *,
 bool block_builder_empty(struct block_builder *);
 
 /* compression */
+
+void* mtbl_writer_threadq_worker(void* arg);
+void* mtbl_writer_threadq_writer(void* arg);
+void mtbl_writer_destroy_threadq(struct mtbl_writer*);
 
 mtbl_res _mtbl_compress_lz4	(const uint8_t *, const size_t, uint8_t **, size_t *);
 mtbl_res _mtbl_compress_lz4hc	(const uint8_t *, const size_t, uint8_t **, size_t *, int);
