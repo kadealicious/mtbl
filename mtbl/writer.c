@@ -52,6 +52,16 @@ struct mtbl_writer {
 	uint64_t			pending_offset;
 };
 
+struct mtbl_compression_job {
+	uint8_t* raw_data;
+	size_t raw_data_size;
+};
+
+struct mtbl_compression_result {
+	uint8_t* compressed_data;
+	size_t compressed_data_size;
+};
+
 static void _mtbl_writer_finish(struct mtbl_writer *);
 static void _mtbl_writer_flush(struct mtbl_writer *);
 static void _write_all(int fd, const uint8_t *, size_t);
@@ -59,6 +69,9 @@ static size_t _mtbl_writer_writeblock(
 	struct mtbl_writer *,
 	struct block_builder *,
 	mtbl_compression_type);
+
+void* _mtbl_writer_threadq_worker(void* arg);
+void* _mtbl_writer_threadq_writer(void* arg);
 
 struct mtbl_writer_options *
 mtbl_writer_options_init(void)
@@ -156,16 +169,16 @@ mtbl_writer_init_fd(int orig_fd, const struct mtbl_writer_options *opt)
 	w->data = block_builder_init(w->opt.block_restart_interval);
 	w->index = block_builder_init(w->opt.block_restart_interval);
 
-	// Create running & ready thread queues for compression.
+	// Create compression thread queues and a writer thread.
 	w->ready_threads = threadq_init();
 	w->running_threads = threadq_init();
 	for (size_t i = 0; i < opt->thread_count; i++) {
-		struct threadq_worker* wrk = threadq_worker_init(mtbl_writer_threadq_worker);
+		struct threadq_worker* wrk = threadq_worker_init(_mtbl_writer_threadq_worker);
 		threadq_add(w->ready_threads, wrk);
 		w->open_thread_count++;
 	}
-	
-	pthread_create(&w->writer_thread, NULL, mtbl_writer_threadq_writer, w);
+	pthread_create(&w->writer_thread, NULL, _mtbl_writer_threadq_writer, w);
+	printf("Created %lu compression threads!\n", w->open_thread_count);
 
 	return (w);
 }
@@ -197,8 +210,29 @@ mtbl_writer_destroy(struct mtbl_writer **w)
 	block_builder_destroy(&((*w)->data));
 	block_builder_destroy(&((*w)->index));
 	ubuf_destroy(&(*w)->last_key);
+
+	printf("Sending shutdown signal...\n");
+	// Get the next available ready thread and send it the shutdown signal.
+	struct threadq_worker* wrk_shutdown = threadq_next((*w)->ready_threads);
+	threadq_worker_send_work(wrk_shutdown, THREADQ_SHUTDOWN);
+	threadq_add((*w)->running_threads, wrk_shutdown);
+	pthread_join((*w)->writer_thread, NULL);
+	
+	printf("Closing all finished threads...\n");
+	// Close all ready threads (running threads will eventually become ready).
+	while ((*w)->open_thread_count > 0) {
+		struct threadq_worker* wrk = threadq_next((*w)->ready_threads);
+		threadq_worker_join(wrk);
+		threadq_worker_destroy(&wrk);
+		(*w)->open_thread_count--;
+	}
+	printf("Destroying thread queues...\n");
+	threadq_destroy(&((*w)->ready_threads));
+	threadq_destroy(&((*w)->running_threads));
+
 	free(*w);
 	*w = NULL;
+	printf("Writer destroyed!\n");
 }
 
 mtbl_res
@@ -245,84 +279,6 @@ mtbl_writer_add(struct mtbl_writer *w,
 	w->m.bytes_values += len_val;
 	block_builder_add(w->data, key, len_key, val, len_val);
 	return (mtbl_res_success);
-}
-
-void *
-mtbl_writer_threadq_worker(void *arg)
-{
-	struct threadq_worker *wrk = arg;
-	mtbl_threadq_job *job;
-	mtbl_threadq_result *r;
-
-	/* If we ever receive work == NULL, that means the shutdown signal 
-	 * was passed to that thread (and there is no more work to be done). */
-	while ((job = threadq_worker_recv_work(wrk)) != NULL) {
-		if ((void *)job == THREADQ_SHUTDOWN) {
-			threadq_worker_send_result(wrk, NULL);
-			continue;
-		}
-
-		/* Copy data block from job to result, then compress the block 
-		 * in result.  Finally, send the compressed block back to the 
-		 * worker thread and dispose of the job block.  This result can 
-		 * later be retrieved by calling threadq_worker_recv_result() 
-		 * on this same worker thread. */
-		r = calloc(1, sizeof(*r));
-		
-		printf("Compressing...\n");
-
-		threadq_worker_send_result(wrk, r);
-		free(job);
-	}
-
-	return NULL;
-}
-
-void *
-mtbl_writer_threadq_writer(void *arg)
-{
-	struct mtbl_writer *wr = arg;
-
-	while (true) {
-
-		// Retrieve the next compressed block to be written to disk.
-		struct threadq_worker *wrk = threadq_next(wr->running_threads);
-		mtbl_threadq_result *r = threadq_worker_recv_result(wrk);
-		threadq_add(wr->ready_threads, wrk);
-
-		// If the work result is NULL, we have no writing to do.
-		if (r == NULL) {
-			break;
-		}
-
-		printf("Writing...\n");
-		free(r);
-	}
-
-	return NULL;
-}
-
-void
-mtbl_writer_destroy_threadq(struct mtbl_writer* w)
-{
-	if (w == NULL) return;
-	
-	// Get the next available ready thread and send it the shutdown signal.
-	struct threadq_worker* wrk_shutdown = threadq_next(w->ready_threads);
-	threadq_worker_send_work(wrk_shutdown, THREADQ_SHUTDOWN);
-
-	pthread_join(w->writer_thread, NULL);
-	
-	// Close all ready threads (running threads will eventually become ready).
-	while (w->open_thread_count > 0) {
-		struct threadq_worker* wrk = threadq_next(w->ready_threads);
-		threadq_worker_join(wrk);
-		threadq_worker_destroy(&wrk);
-		w->open_thread_count--;
-	}
-
-	threadq_destroy(&w->ready_threads);
-	threadq_destroy(&w->running_threads);
 }
 
 static void
@@ -444,4 +400,59 @@ _write_all(int fd, const uint8_t *buf, size_t size)
 		buf += bytes_written;
 		size -= bytes_written;
 	}
+}
+
+void *
+_mtbl_writer_threadq_worker(void *arg)
+{
+	struct threadq_worker *wrk = arg;
+	struct mtbl_compression_job *job;
+	struct mtbl_compression_result *r;
+
+	/* If we ever receive work == NULL, that means the shutdown signal 
+	 * was passed to that thread (and there is no more work to be done). */
+	while ((job = threadq_worker_recv_work(wrk)) != NULL) {
+		if ((void *)job == THREADQ_SHUTDOWN) {
+			threadq_worker_send_result(wrk, NULL);
+			continue;
+		}
+
+		/* Copy data block from job to result, then compress the block 
+		 * in result.  Finally, send the compressed block back to the 
+		 * worker thread and dispose of the job block.  This result can 
+		 * later be retrieved by calling threadq_worker_recv_result() 
+		 * on this same worker thread. */
+		r = calloc(1, sizeof(*r));
+		
+		printf("Compressing...\n");
+
+		threadq_worker_send_result(wrk, r);
+		free(job);
+	}
+
+	return NULL;
+}
+
+void *
+_mtbl_writer_threadq_writer(void *arg)
+{
+	struct mtbl_writer *wr = arg;
+
+	while (true) {
+
+		// Retrieve the next compressed block to be written to disk.
+		struct threadq_worker *wrk = threadq_next(wr->running_threads);
+		struct mtbl_compression_result *r = threadq_worker_recv_result(wrk);
+		threadq_add(wr->ready_threads, wrk);
+
+		// If the work result is NULL, we have no writing to do.
+		if (r == NULL) {
+			break;
+		}
+
+		printf("Writing...\n");
+		free(r);
+	}
+
+	return NULL;
 }

@@ -20,8 +20,8 @@ for compression_type in \
     lz4hc \
     zstd \
 ; do
-    echo "$0: Testing compression type ${compression_type}"
-    "${top_builddir}/t/test-threaded-compression" "${compression_type}"
+    echo "$0: Testing compression type ${compression_type} with 8 threads"
+    "${top_builddir}/t/test-threaded-compression" "${compression_type} 8"
 done
 
 exit 0
