@@ -70,6 +70,8 @@ test_threaded_compression(mtbl_compression_type c_type,
 		return 1;
 	}
 
+	printf("---Begin write...\n");
+
 	/* Open a writer on the temporary file. */
 	struct mtbl_writer_options *wopt = mtbl_writer_options_init();
 	mtbl_writer_options_set_compression(wopt, c_type);
@@ -91,6 +93,8 @@ test_threaded_compression(mtbl_compression_type c_type,
 
 	/* Close the writer. */
 	mtbl_writer_destroy(&w);
+	
+	printf("---Write success!  Beginning read...\n");
 
 	/* Open the reader on the dup()'d file descriptor. */
 	struct mtbl_reader *r = mtbl_reader_init_fd(dup_fd, NULL);
@@ -98,6 +102,8 @@ test_threaded_compression(mtbl_compression_type c_type,
 		fprintf(stderr, NAME ": mtbl_reader_init_fd() failed\n");
 		return 1;
 	}
+
+	printf("---Reader initialized!\n");
 
 	/**
 	 * Check that the compression algorithm on the reader was what we set
@@ -112,6 +118,8 @@ test_threaded_compression(mtbl_compression_type c_type,
 		return 1;
 	}
 
+	printf("---Reader compression matches writer!  Reading from file...\n");
+
 	/* Retrieve the test key/value entry. */
 	const struct mtbl_source *s = mtbl_reader_source(r);
 	if (s == NULL) {
@@ -119,9 +127,11 @@ test_threaded_compression(mtbl_compression_type c_type,
 		return 1;
 	}
 	struct mtbl_iter *it = mtbl_source_iter(s);
+	printf("---Source iterator created!\n");
 	const uint8_t *it_key, *it_val;
 	size_t len_it_key, len_it_val;
 	res = mtbl_iter_next(it, &it_key, &len_it_key, &it_val, &len_it_val);
+	printf("---Source iterated upon!\n");
 	if (res != mtbl_res_success) {
 		fprintf(stderr, NAME ": mtbl_iter_next() failed\n");
 		return 1;
@@ -152,6 +162,8 @@ test_threaded_compression(mtbl_compression_type c_type,
 			"additional unexpected entry\n");
 		return 1;
 	}
+
+	printf("---Read successful!\n");
 
 	/* Cleanup. */
 	mtbl_iter_destroy(&it);
