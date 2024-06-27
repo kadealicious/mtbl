@@ -35,8 +35,8 @@ test_threaded_compression(mtbl_compression_type c_type,
 	mtbl_res res;
 
 	/* Initialize test key/value. */
-	size_t len_key = 10000;
-	size_t len_val = 20000;
+	size_t len_key = 100000;
+	size_t len_val = 200000;
 	uint8_t *key = my_malloc(len_key);
 	uint8_t *val = my_malloc(len_val);
 	memset(key, 'A', len_key);
@@ -94,7 +94,7 @@ test_threaded_compression(mtbl_compression_type c_type,
 	/* Close the writer. */
 	mtbl_writer_destroy(&w);
 	
-	printf("---Write success!  Beginning read...\n");
+	printf("---Beginning read...\n");
 
 	/* Open the reader on the dup()'d file descriptor. */
 	struct mtbl_reader *r = mtbl_reader_init_fd(dup_fd, NULL);
@@ -118,7 +118,7 @@ test_threaded_compression(mtbl_compression_type c_type,
 		return 1;
 	}
 
-	printf("---Reader compression matches writer!  Reading from file...\n");
+	printf("---Reading from file...\n");
 
 	/* Retrieve the test key/value entry. */
 	const struct mtbl_source *s = mtbl_reader_source(r);

@@ -43,6 +43,7 @@ struct mtbl_writer {
 	struct threadq*			ready_threads;
 	struct threadq*			writing_threads;
 
+	// Thread for copying compressed blocks into the writer.
 	pthread_t			writer_thread;
 	pthread_mutex_t			writer_m;
 	pthread_cond_t			writer_c;
@@ -81,8 +82,8 @@ static size_t _mtbl_writer_writeblock(
 	struct block_builder *,
 	mtbl_compression_type);
 
-void* _mtbl_writer_threadq_worker(void* arg);
-void* _mtbl_writer_threadq_writer(void* arg);
+static void* _mtbl_writer_threadq_worker(void* arg);
+static void* _mtbl_writer_threadq_writer(void* arg);
 
 struct mtbl_writer_options *
 mtbl_writer_options_init(void)
@@ -393,12 +394,12 @@ _mtbl_writer_writeblock(struct mtbl_writer *w,
 	
 	pthread_mutex_unlock(&w->writer_m);
 
-	printf("Block written and cleaned up!\n");
+	printf("Block written and cleaned up (%lu bytes written)!\n", bytes_written);
 	
 	return (bytes_written);
 }
 
-void *
+static void *
 _mtbl_writer_threadq_writer(void *arg)
 {
 	struct mtbl_writer *w = arg;
@@ -436,7 +437,7 @@ _mtbl_writer_threadq_writer(void *arg)
 	return NULL;
 }
 
-void *
+static void *
 _mtbl_writer_threadq_worker(void *arg)
 {
 	struct threadq_worker *wrk = arg;
