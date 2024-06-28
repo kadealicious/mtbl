@@ -84,6 +84,7 @@ static size_t _mtbl_writer_writeblock(
 
 static void* _mtbl_writer_threadq_worker(void* arg);
 static void* _mtbl_writer_threadq_writer(void* arg);
+static void _mtbl_shutdown_threads(struct mtbl_writer **w);
 
 struct mtbl_writer_options *
 mtbl_writer_options_init(void)
@@ -228,6 +229,16 @@ mtbl_writer_destroy(struct mtbl_writer **w)
 	block_builder_destroy(&((*w)->index));
 	ubuf_destroy(&(*w)->last_key);
 
+	_mtbl_shutdown_threads(w);
+
+	free(*w);
+	*w = NULL;
+	printf("Writer destroyed!\n");
+}
+
+static void
+_mtbl_shutdown_threads(struct mtbl_writer **w) {
+	
 	printf("Sending shutdown signal...\n");
 	// Get the next available ready thread and send it the shutdown signal.
 	struct threadq_worker* wrk_shutdown = threadq_next((*w)->ready_threads);
@@ -249,10 +260,6 @@ mtbl_writer_destroy(struct mtbl_writer **w)
 	printf("Destroying thread queues...\n");
 	threadq_destroy(&((*w)->ready_threads));
 	threadq_destroy(&((*w)->writing_threads));
-
-	free(*w);
-	*w = NULL;
-	printf("Writer destroyed!\n");
 }
 
 mtbl_res
