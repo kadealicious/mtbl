@@ -70,7 +70,7 @@ test_threaded_compression(mtbl_compression_type c_type,
 		return 1;
 	}
 
-	printf("---Begin write...\n");
+	printf("\n\n\n\n---Begin write...\n");
 
 	/* Open a writer on the temporary file. */
 	struct mtbl_writer_options *wopt = mtbl_writer_options_init();
@@ -126,6 +126,8 @@ test_threaded_compression(mtbl_compression_type c_type,
 		fprintf(stderr, NAME ": mtbl_reader_source() failed\n");
 		return 1;
 	}
+	printf("---Reader source created!\n");
+
 	struct mtbl_iter *it = mtbl_source_iter(s);
 	printf("---Source iterator created!\n");
 	const uint8_t *it_key, *it_val;
@@ -205,9 +207,9 @@ main(int argc, char **argv)
 		return EXIT_FAILURE;
 	}
 
-	if (atoi(argv[2]) < 1) {
+	if (atoi(argv[2]) < 0) {
 		fprintf(stderr, "%s: Error: Thread count must be greater than "
-				"0\n", argv[0]);
+				"-1\n", argv[0]);
 		return EXIT_FAILURE;
 	}
 	thread_count = (size_t)atoi(argv[2]);
