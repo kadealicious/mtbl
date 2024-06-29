@@ -74,6 +74,7 @@ test_threaded_compression(mtbl_compression_type c_type,
 
 	/* Open a writer on the temporary file. */
 	struct mtbl_writer_options *wopt = mtbl_writer_options_init();
+	mtbl_writer_options_set_block_size(wopt, 64);
 	mtbl_writer_options_set_compression(wopt, c_type);
 	mtbl_writer_options_set_thread_count(wopt, thread_count);
 
