@@ -75,28 +75,22 @@ struct mtbl_writer_compression_result {
 
 static void _mtbl_writer_finish(struct mtbl_writer *);
 static void _mtbl_writer_flush(struct mtbl_writer *);
-static void _write_all(int fd, const uint8_t *, size_t);
-
 static void _mtbl_writer_writeblock(
 	struct mtbl_writer *,
 	struct block_builder *,
-	mtbl_compression_type);
-static void _mtbl_writer_writeblock_threads(
-	struct mtbl_writer *, 
-        struct block_builder *,
-        mtbl_compression_type);
-static void _mtbl_writer_writeblock_nothreads(
-	struct mtbl_writer *, 
-        struct block_builder *,
-        mtbl_compression_type);
+	mtbl_compression_type, 
+	bool is_index_block);
 
-static void _mtbl_writer_compressblock(
-	uint8_t *src_block,
+static void _compress_block(
+	uint8_t *src,
 	size_t src_size,
-	uint8_t **dst_block,
+	uint8_t **dst,
 	size_t *dst_size,
 	mtbl_compression_type,
-	int compression_level);
+	int comp_level);
+static size_t _write_block(int fd, uint8_t *block, size_t block_size);
+static void _write_all(int fd, const uint8_t *block, size_t block_size);
+static void _update_metadata(struct mtbl_writer *, size_t, bool);
 
 static void* _mtbl_writer_compressionthread(void *worker_thread);
 static void* _mtbl_writer_writerthread(void *writer);
@@ -232,9 +226,6 @@ mtbl_writer_destroy(struct mtbl_writer **w)
 		close((*w)->fd);
 	}
 
-	printf("Data blocks: %lu %lu\n", (*w)->m.bytes_data_blocks, (*w)->m.count_data_blocks);
-	printf("Index block: %lu %lu\n", (*w)->m.bytes_index_block, (*w)->m.index_block_offset);
-
 	block_builder_destroy(&((*w)->data));
 	block_builder_destroy(&((*w)->index));
 	ubuf_destroy(&(*w)->last_key);
@@ -312,7 +303,7 @@ _mtbl_writer_finish(struct mtbl_writer *w)
 		w->pending_index_entry = false;
 	}
 
-	_mtbl_writer_writeblock(w, w->index, MTBL_COMPRESSION_NONE);
+	_mtbl_writer_writeblock(w, w->index, MTBL_COMPRESSION_NONE, true);
 }
 
 static void
@@ -323,58 +314,72 @@ _mtbl_writer_flush(struct mtbl_writer *w)
 		return;
 	assert(!w->pending_index_entry);
 
-	_mtbl_writer_writeblock(w, w->data, w->opt.compression_type);
+	_mtbl_writer_writeblock(w, w->data, w->opt.compression_type, false);
 	w->pending_index_entry = true;
 }
 
 static void
 _mtbl_writer_writeblock(struct mtbl_writer *w,
 			struct block_builder *b,
-			mtbl_compression_type compression_type)
+			mtbl_compression_type comp_type, 
+			bool is_index_block)
 {
 	assert(w->m.file_version == MTBL_FORMAT_V2);
 
 	if (w->opt.thread_count == 0) {
-		_mtbl_writer_writeblock_nothreads(w, b, compression_type);
+		
+		// Raw and compressed data blocks.
+		uint8_t *raw = NULL;
+		uint8_t *comp = NULL;
+		size_t raw_size = 0;
+		size_t comp_size = 0;
+
+		/* First, finish the block and compress it.  Then write the block 
+		 * to disk, and update the mtbl_writer's metadata about the block 
+		 * we just wrote. */
+		block_builder_finish(b, &raw, &raw_size);
+		_compress_block(raw, raw_size, &comp, &comp_size, comp_type, w->opt.compression_level);
+		size_t bytes_written = _write_block(w->fd, comp, comp_size);
+		_update_metadata(w, bytes_written, is_index_block);
+
+		// Cleanup.
+		block_builder_reset(b);
+		free(raw);
+		if (comp_type != MTBL_COMPRESSION_NONE)
+			free(comp);
 	} else {
-		_mtbl_writer_writeblock_threads(w, b, compression_type);
+
+		/* Send the next compression thread in the ready queue our current job, 
+		 * then add it to the writing queue so it can be written to disk once 
+		 * it has arrived at the top of the queue (and its work is done). */
+		struct threadq_worker *wrk = threadq_next(w->ready_threads);
+		struct mtbl_writer_compression_job* job = calloc(1, sizeof(*job));
+
+		/* The index block's write has different side-effects than the data 
+		 * blocks', so the writer thread must be made aware of this. */
+		if (b == w->index) job->is_data_block = false;
+		else job->is_data_block = true;
+		
+		// Prepare the job!
+		job->compression_type = comp_type;
+		job->compression_level = w->opt.compression_level;
+		block_builder_finish(b, &job->raw_data, &job->raw_data_size);
+
+		/* Once compression finishes, the writer thread will automatically receive 
+		 * up the block and write it to disk. */
+		threadq_worker_send_work(wrk, job);
+		threadq_add(w->writing_threads, wrk); 
 	}
 }
 
 static void
-_mtbl_writer_writeblock_nothreads(struct mtbl_writer *w, 
-                                  struct block_builder *b,
-                        	  mtbl_compression_type compression_type)
+_update_metadata(struct mtbl_writer *w, size_t bytes_written, bool is_index_block)
 {
-	uint8_t *raw_contents = NULL, *block_contents = NULL;
-	size_t raw_contents_size = 0, block_contents_size = 0;
-
-	block_builder_finish(b, &raw_contents, &raw_contents_size);
-	_mtbl_writer_compressblock(
-		raw_contents,
-		raw_contents_size, 
-		&block_contents,
-		&block_contents_size,
-		compression_type,
-		w->opt.compression_level
-	);
-
-	const uint32_t crc = htole32(mtbl_crc32c(block_contents, block_contents_size));
-	size_t len_length;
-	uint8_t len[10];
-	len_length = mtbl_varint_encode64(len, block_contents_size);
-
-	_write_all(w->fd, (const uint8_t *) len, len_length);
-	_write_all(w->fd, (const uint8_t *) &crc, sizeof(crc));
-	_write_all(w->fd, block_contents, block_contents_size);
-
-	const size_t bytes_written = (len_length + sizeof(crc) + block_contents_size);
 	w->last_offset = w->pending_offset;
 	w->pending_offset += bytes_written;
 	
 	// Data blocks have different side-effects than index blocks.
-	bool is_data_block = (w->data == b) ? true : false;
-	if (is_data_block) {
+	if (!is_index_block) {
 		w->m.bytes_data_blocks += bytes_written;
 		w->m.count_data_blocks += 1;
 	} else {
@@ -385,42 +390,6 @@ _mtbl_writer_writeblock_nothreads(struct mtbl_writer *w,
 		metadata_write(&w->m, tbuf);
 		_write_all(w->fd, tbuf, sizeof(tbuf));
 	}
-
-	block_builder_reset(b);
-	free(raw_contents);
-	if (compression_type != MTBL_COMPRESSION_NONE)
-		free(block_contents);
-}
-
-static void
-_mtbl_writer_writeblock_threads(struct mtbl_writer *w, 
-                        	struct block_builder *b,
-                        	mtbl_compression_type compression_type)
-{
-	/* Send the next compression thread in the ready queue our current job, 
-	 * then add it to the writing queue so it can be written to disk once 
-	 * it has arrived at the top of the queue (and its work is done). */
-	struct threadq_worker *wrk = threadq_next(w->ready_threads);
-	struct mtbl_writer_compression_job* job = calloc(1, sizeof(*job));
-
-	/* The index block's write has different side-effects than the data 
-	 * blocks', so the writer thread must be made aware of this. */
-	if (b == w->index) {
-		job->is_data_block = false;
-	} else {
-		job->is_data_block = true;
-	}
-
-	job->compression_type = compression_type;
-	job->compression_level = w->opt.compression_level;
-	block_builder_finish(b, &job->raw_data, &job->raw_data_size);
-
-	// printf("Job size when block built: %lu\n", job->raw_data_size);
-	threadq_worker_send_work(wrk, job);
-	threadq_add(w->writing_threads, wrk);
- 
-	/* Once compression finishes, the writer thread will automatically receive 
-	 * up the block and write it to disk. */
 }
 
 static void *
@@ -446,7 +415,7 @@ _mtbl_writer_compressionthread(void *arg)
 		res = calloc(1, sizeof(*res));
 		
 		printf("Compressing...\n");
-		_mtbl_writer_compressblock(
+		_compress_block(
 			job->raw_data,
 			job->raw_data_size, 
 			&res->compressed_data,
@@ -533,6 +502,22 @@ _mtbl_writer_writerthread(void *arg)
 	return NULL;
 }
 
+static size_t
+_write_block(int fd, uint8_t *block, size_t block_size)
+{
+	const uint32_t crc = htole32(mtbl_crc32c(block, block_size));
+	size_t len_length;
+	uint8_t len[10];
+	len_length = mtbl_varint_encode64(len, block_size);
+
+	_write_all(fd, (const uint8_t *) len, len_length);
+	_write_all(fd, (const uint8_t *) &crc, sizeof(crc));
+	_write_all(fd, block, block_size);
+
+	const size_t bytes_written = (len_length + sizeof(crc) + block_size);
+	return bytes_written;
+}
+
 static void
 _write_all(int fd, const uint8_t *buf, size_t size)
 {
@@ -555,12 +540,12 @@ _write_all(int fd, const uint8_t *buf, size_t size)
 }
 
 static void
-_mtbl_writer_compressblock(uint8_t* src_block,
-			   size_t src_size, 
-			   uint8_t** dst_block, 
-			   size_t* dst_size, 
-			   mtbl_compression_type compression_type, 
-			   int compression_level)
+_compress_block(uint8_t* src_block,
+		size_t src_size, 
+		uint8_t** dst_block, 
+		size_t* dst_size, 
+		mtbl_compression_type compression_type, 
+		int compression_level)
 {
 	if (compression_type == MTBL_COMPRESSION_NONE) {
 		*dst_block = src_block;
@@ -575,6 +560,7 @@ _mtbl_writer_compressblock(uint8_t* src_block,
 			dst_size
 		);
 		assert(compression_result == mtbl_res_success);
+
 	} else {
 		mtbl_res compression_result = mtbl_compress_level(
 			compression_type,
