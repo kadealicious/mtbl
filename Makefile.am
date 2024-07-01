@@ -234,13 +234,6 @@ t_test_compression_SOURCES = t/test-compression.c
 t_test_compression_LDADD = mtbl/libmtbl.la
 t/test-compression.sh: t/test-compression
 
-TESTS += t/test-threaded-compression.sh
-EXTRA_DIST += t/test-threaded-compression.sh
-check_PROGRAMS += t/test-threaded-compression
-t_test_threaded_compression_SOURCES = t/test-threaded-compression.c
-t_test_threaded_compression_LDADD = mtbl/libmtbl.la
-t/test-threaded-compression.sh: t/test-threaded-compression
-
 #
 ##
 ### documentation

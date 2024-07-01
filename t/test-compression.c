@@ -27,7 +27,7 @@
  * avoids leaving the temporary file on the filesystem if the test fails.
  */
 static int
-test_compression(mtbl_compression_type c_type, const char *dirname)
+test_compression(mtbl_compression_type c_type, const char *dirname, size_t thread_count)
 {
 	mtbl_res res;
 
@@ -70,6 +70,7 @@ test_compression(mtbl_compression_type c_type, const char *dirname)
 	/* Open a writer on the temporary file. */
 	struct mtbl_writer_options *wopt = mtbl_writer_options_init();
 	mtbl_writer_options_set_compression(wopt, c_type);
+	mtbl_writer_options_set_thread_count(wopt, thread_count);
 	struct mtbl_writer *w = mtbl_writer_init_fd(fd, wopt);
 	mtbl_writer_options_destroy(&wopt);
 	if (w == NULL) {
@@ -158,12 +159,12 @@ test_compression(mtbl_compression_type c_type, const char *dirname)
 }
 
 static int
-check(int ret, const char *s1, const char *s2)
+check(int ret, const char *s1, const char *s2, const int i)
 {
 	if (ret == 0)
-		fprintf(stderr, NAME ": PASS: %s %s\n", s1, s2);
+		fprintf(stderr, NAME ": PASS: %s %s %d\n", s1, s2, i);
 	else
-		fprintf(stderr, NAME ": FAIL: %s %s\n", s1, s2);
+		fprintf(stderr, NAME ": FAIL: %s %s %d\n", s1, s2, i);
 	return ret;
 }
 
@@ -172,10 +173,13 @@ main(int argc, char **argv)
 {
 	int ret = 0;
 	mtbl_compression_type c_type;
+	int thread_count;
 	mtbl_res res;
 
-	if (argc != 2) {
-		fprintf(stderr, "Usage: %s <COMPRESSION TYPE>\n", argv[0]);
+	if (argc < 2 || argc > 3) {
+		fprintf(stderr, "Usage: %s <COMPRESSION TYPE> OR"
+				"%s <COMPRESSION TYPE> <THREAD COUNT>\n", 
+				argv[0], argv[0]);
 		return EXIT_FAILURE;
 	}
 
@@ -186,7 +190,17 @@ main(int argc, char **argv)
 		return EXIT_FAILURE;
 	}
 
-	ret |= check(test_compression(c_type, dirname(argv[1])), "test_compression", argv[1]);
+	if (argc == 3)	thread_count = (size_t)atoi(argv[2]);
+	else		thread_count = 0;
+
+	if (thread_count < 0) {
+		fprintf(stderr, "%s: Error: Thread count must be greater than "
+				"-1\n", argv[0]);
+		return EXIT_FAILURE;
+	}
+
+	int test = test_compression(c_type, dirname(argv[1]), (size_t) thread_count);
+	ret |= check(test, "test_compression", argv[1], thread_count);
 
 	if (ret)
 		return EXIT_FAILURE;
