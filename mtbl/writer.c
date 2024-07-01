@@ -38,15 +38,10 @@ struct mtbl_writer {
 
 	struct mtbl_writer_options	opt;
 
-	// Compression threads; see thread_count in mtbl_writer_options.
 	size_t				open_thread_count;
 	struct threadq*			ready_threads;
 	struct threadq*			writing_threads;
-
-	// Thread for copying compressed blocks into the writer.
 	pthread_t			writer_thread;
-	pthread_mutex_t			writer_m;
-	pthread_cond_t			writer_c;
 
 	ubuf				*last_key;
 	uint64_t			last_offset;
@@ -57,20 +52,16 @@ struct mtbl_writer {
 };
 
 struct mtbl_writer_compression_job {
-	bool			is_data_block;
+	mtbl_compression_type	comp_type;
+	int			comp_level;
 
-	mtbl_compression_type	compression_type;
-	int			compression_level;
-
-	uint8_t*		raw_data;
-	size_t			raw_data_size;
+	uint8_t*		raw_block;
+	size_t			raw_block_size;
 };
 
 struct mtbl_writer_compression_result {
-	bool			is_data_block;
-
-	uint8_t*		compressed_data;
-	size_t			compressed_data_size;
+	uint8_t*		comp_block;
+	size_t			comp_block_size;
 };
 
 static void _mtbl_writer_finish(struct mtbl_writer *);
@@ -81,21 +72,24 @@ static void _mtbl_writer_writeblock(
 	mtbl_compression_type, 
 	bool is_index_block);
 
+static size_t _write_block(int fd, uint8_t *block, size_t block_size);
+static void _write_all(int fd, const uint8_t *block, size_t block_size);
 static void _compress_block(
-	uint8_t *src,
+	uint8_t *src_block,
 	size_t src_size,
-	uint8_t **dst,
+	uint8_t **dst_block,
 	size_t *dst_size,
 	mtbl_compression_type,
 	int comp_level);
-static size_t _write_block(int fd, uint8_t *block, size_t block_size);
-static void _write_all(int fd, const uint8_t *block, size_t block_size);
-static void _update_metadata(struct mtbl_writer *, size_t, bool);
+static void _update_metadata(
+	struct mtbl_writer *,
+	size_t bytes_written,
+	bool is_index_block);
 
 static void* _mtbl_writer_compressionthread(void *worker_thread);
 static void* _mtbl_writer_writerthread(void *writer);
-static void _mtbl_writer_shutdown_threads(struct mtbl_writer **);
-static void _mtbl_writer_start_threads(struct mtbl_writer **);
+static void _mtbl_writer_shutdown_threads(struct mtbl_writer *);
+static void _mtbl_writer_start_threads(struct mtbl_writer *);
 
 struct mtbl_writer_options *
 mtbl_writer_options_init(void)
@@ -195,7 +189,7 @@ mtbl_writer_init_fd(int orig_fd, const struct mtbl_writer_options *opt)
 
 	// Create compression thread queues and a writer thread.
 	if (w->opt.thread_count > 0)
-		_mtbl_writer_start_threads(&w);
+		_mtbl_writer_start_threads(w);
 
 	return (w);
 }
@@ -221,8 +215,6 @@ mtbl_writer_destroy(struct mtbl_writer **w)
 
 	if (!(*w)->closed) {	
 		_mtbl_writer_finish(*w);
-		if ((*w)->opt.thread_count > 0)
-			_mtbl_writer_shutdown_threads(w);
 		close((*w)->fd);
 	}
 
@@ -232,7 +224,6 @@ mtbl_writer_destroy(struct mtbl_writer **w)
 
 	free(*w);
 	*w = NULL;
-	printf("Writer destroyed!\n");
 }
 
 mtbl_res
@@ -303,6 +294,9 @@ _mtbl_writer_finish(struct mtbl_writer *w)
 		w->pending_index_entry = false;
 	}
 
+	// Destroy our threads and write the final index block to disk.
+	if (w->opt.thread_count > 0)
+		_mtbl_writer_shutdown_threads(w);
 	_mtbl_writer_writeblock(w, w->index, MTBL_COMPRESSION_NONE, true);
 }
 
@@ -326,180 +320,69 @@ _mtbl_writer_writeblock(struct mtbl_writer *w,
 {
 	assert(w->m.file_version == MTBL_FORMAT_V2);
 
-	if (w->opt.thread_count == 0) {
+	/* If threading is disabled OR we are trying to write the index block 
+	 * to disk, we will handle this block non-concurrently. */
+	if (w->opt.thread_count == 0 || is_index_block) {
 		
-		// Raw and compressed data blocks.
-		uint8_t *raw = NULL;
-		uint8_t *comp = NULL;
+		uint8_t *raw_block = NULL;
+		uint8_t *comp_block = NULL;
 		size_t raw_size = 0;
 		size_t comp_size = 0;
 
-		/* First, finish the block and compress it.  Then write the block 
-		 * to disk, and update the mtbl_writer's metadata about the block 
-		 * we just wrote. */
-		block_builder_finish(b, &raw, &raw_size);
-		_compress_block(raw, raw_size, &comp, &comp_size, comp_type, w->opt.compression_level);
-		size_t bytes_written = _write_block(w->fd, comp, comp_size);
+		// Compress, write to disk, and update metadata about the block.
+		block_builder_finish(b, &raw_block, &raw_size);
+		_compress_block(raw_block, raw_size, &comp_block, &comp_size, 
+				comp_type, w->opt.compression_level);
+		size_t bytes_written = _write_block(w->fd, comp_block, comp_size);
 		_update_metadata(w, bytes_written, is_index_block);
 
 		// Cleanup.
 		block_builder_reset(b);
-		free(raw);
+		free(raw_block);
 		if (comp_type != MTBL_COMPRESSION_NONE)
-			free(comp);
+			free(comp_block);
 	} else {
 
-		/* Send the next compression thread in the ready queue our current job, 
-		 * then add it to the writing queue so it can be written to disk once 
-		 * it has arrived at the top of the queue (and its work is done). */
+		// Get the next available worker thread.
 		struct threadq_worker *wrk = threadq_next(w->ready_threads);
 		struct mtbl_writer_compression_job* job = calloc(1, sizeof(*job));
 
-		/* The index block's write has different side-effects than the data 
-		 * blocks', so the writer thread must be made aware of this. */
-		if (b == w->index) job->is_data_block = false;
-		else job->is_data_block = true;
-		
 		// Prepare the job!
-		job->compression_type = comp_type;
-		job->compression_level = w->opt.compression_level;
-		block_builder_finish(b, &job->raw_data, &job->raw_data_size);
+		job->comp_type = comp_type;
+		job->comp_level = w->opt.compression_level;
+		block_builder_finish(b, &job->raw_block, &job->raw_block_size);
 
-		/* Once compression finishes, the writer thread will automatically receive 
-		 * up the block and write it to disk. */
+		/* Once compression finishes, the writer thread will 
+		 * automagically receive up the block and write it to disk. */
 		threadq_worker_send_work(wrk, job);
 		threadq_add(w->writing_threads, wrk); 
 	}
 }
 
 static void
-_update_metadata(struct mtbl_writer *w, size_t bytes_written, bool is_index_block)
+_compress_block(uint8_t* src_block,
+		size_t src_size, 
+		uint8_t** dst_block, 
+		size_t* dst_size, 
+		mtbl_compression_type comp_type, 
+		int comp_level)
 {
-	w->last_offset = w->pending_offset;
-	w->pending_offset += bytes_written;
-	
-	// Data blocks have different side-effects than index blocks.
-	if (!is_index_block) {
-		w->m.bytes_data_blocks += bytes_written;
-		w->m.count_data_blocks += 1;
+	mtbl_res res;
+
+	if (comp_type == MTBL_COMPRESSION_NONE) {
+		*dst_block = src_block;
+		*dst_size = src_size;
+		res = mtbl_res_success;
+
+	} else if (comp_level == DEFAULT_COMPRESSION_LEVEL) {
+		res = mtbl_compress(comp_type, src_block, src_size, dst_block, 
+				    dst_size);
 	} else {
-		w->m.index_block_offset = w->pending_offset - bytes_written;
-		w->m.bytes_index_block = bytes_written;
-		
-		uint8_t tbuf[MTBL_METADATA_SIZE];
-		metadata_write(&w->m, tbuf);
-		_write_all(w->fd, tbuf, sizeof(tbuf));
-	}
-}
-
-static void *
-_mtbl_writer_compressionthread(void *arg)
-{
-	struct threadq_worker *wrk = arg;
-	struct mtbl_writer_compression_job *job;
-	struct mtbl_writer_compression_result *res;
-
-	/* If we ever receive work == NULL, that means the shutdown signal 
-	 * was passed to that thread (and there is no more work to be done). */
-	while ((job = threadq_worker_recv_work(wrk)) != NULL) {
-		if ((void *)job == THREADQ_SHUTDOWN) {
-			threadq_worker_send_result(wrk, NULL);
-			continue;
-		}
-
-		/* Copy data block from job to result, then compress the block 
-		 * in result.  Finally, send the compressed block back to the 
-		 * worker thread and dispose of the job block.  This result can 
-		 * later be retrieved by calling threadq_worker_recv_result() 
-		 * on this same worker thread. */
-		res = calloc(1, sizeof(*res));
-		
-		printf("Compressing...\n");
-		_compress_block(
-			job->raw_data,
-			job->raw_data_size, 
-			&res->compressed_data,
-			&res->compressed_data_size, 
-			job->compression_type,
-			job->compression_level
-		);
-
-		res->is_data_block = job->is_data_block;
-		threadq_worker_send_result(wrk, res);
-		
-		// If no compression, the raw_data pointer is reused in res.
-		if (job->compression_type != MTBL_COMPRESSION_NONE)
-			free(job->raw_data);
-		free(job);
-		printf("Compressed!\n");
+		res = mtbl_compress_level(comp_type, comp_level, src_block, 
+					  src_size, dst_block, dst_size);
 	}
 
-	return NULL;
-}
-
-static void *
-_mtbl_writer_writerthread(void *arg)
-{
-	struct mtbl_writer *w = arg;
-
-	while (true) {
-
-		struct threadq_worker *wrk;
-		struct mtbl_writer_compression_result *res;
-
-		/* Retrieve the next compressed block to be written to disk and 
-		 * place its thread back into the ready queue. */
-		wrk = threadq_next(w->writing_threads);
-		res = threadq_worker_recv_result(wrk);
-		threadq_add(w->ready_threads, wrk);
-
-		if (res == NULL) {
-			break;
-		}
-
-		/* Gather the compressed data the writer thread retrieved and write it 
-		 * out to disk. */
-		printf("Writing to disk...\n");
-
-		const uint32_t crc = htole32(mtbl_crc32c(res->compressed_data, 
-							 res->compressed_data_size));
-		size_t len_length;
-		uint8_t len[10];
-		len_length = mtbl_varint_encode64(len, res->compressed_data_size);
-
-		// printf("Block size when being written: %lu\n", w->data_block_size);
-		_write_all(w->fd, (const uint8_t *) len, len_length);
-		_write_all(w->fd, (const uint8_t *) &crc, sizeof(crc));
-		_write_all(w->fd, res->compressed_data, res->compressed_data_size);
-
-		const size_t bytes_written = (len_length + sizeof(crc) + res->compressed_data_size);
-
-		w->last_offset = w->pending_offset;
-		w->pending_offset += bytes_written;
-	
-		// Data blocks have different side-effects than the index block.
-		if (res->is_data_block) {
-			block_builder_reset(w->data);
-			w->m.bytes_data_blocks += bytes_written;
-			w->m.count_data_blocks += 1;
-		} else {
-			block_builder_reset(w->index);
-			w->m.index_block_offset = w->pending_offset - bytes_written;
-			w->m.bytes_index_block = bytes_written;
-			
-			uint8_t tbuf[MTBL_METADATA_SIZE];
-			metadata_write(&w->m, tbuf);
-			_write_all(w->fd, tbuf, sizeof(tbuf));
-		}
-
-		printf("Written to disk!\n");
-
-		free(res->compressed_data);
-		free(res);
-	}
-
-	printf("Writing has finished!\n");
-	return NULL;
+	assert(res == mtbl_res_success);
 }
 
 static size_t
@@ -540,81 +423,137 @@ _write_all(int fd, const uint8_t *buf, size_t size)
 }
 
 static void
-_compress_block(uint8_t* src_block,
-		size_t src_size, 
-		uint8_t** dst_block, 
-		size_t* dst_size, 
-		mtbl_compression_type compression_type, 
-		int compression_level)
+_update_metadata(struct mtbl_writer *w, size_t bytes_written, bool is_index_block)
 {
-	if (compression_type == MTBL_COMPRESSION_NONE) {
-		*dst_block = src_block;
-		*dst_size = src_size;
-
-	} else if (compression_level == DEFAULT_COMPRESSION_LEVEL) {
-		mtbl_res compression_result = mtbl_compress(
-			compression_type,
-			src_block,
-			src_size,
-			dst_block,
-			dst_size
-		);
-		assert(compression_result == mtbl_res_success);
-
+	w->last_offset = w->pending_offset;
+	w->pending_offset += bytes_written;
+	
+	// Data blocks store different metadata than index blocks.
+	if (!is_index_block) {
+		w->m.bytes_data_blocks += bytes_written;
+		w->m.count_data_blocks += 1;
 	} else {
-		mtbl_res compression_result = mtbl_compress_level(
-			compression_type,
-			compression_level,
-			src_block,
-			src_size,
-			dst_block,
-			dst_size
+		w->m.index_block_offset = w->pending_offset - bytes_written;
+		w->m.bytes_index_block = bytes_written;
+		
+		uint8_t tbuf[MTBL_METADATA_SIZE];
+		metadata_write(&w->m, tbuf);
+		_write_all(w->fd, tbuf, sizeof(tbuf));
+	}
+}
+
+static void *
+_mtbl_writer_compressionthread(void *arg)
+{
+	struct threadq_worker *wrk = arg;
+	struct mtbl_writer_compression_job *job;
+	struct mtbl_writer_compression_result *res;
+
+	/* If we ever receive work == NULL, that means the shutdown signal 
+	 * was passed to that thread (and there is no more work to be done). */
+	while ((job = threadq_worker_recv_work(wrk)) != NULL) {
+		if ((void *)job == THREADQ_SHUTDOWN) {
+			threadq_worker_send_result(wrk, NULL);
+			continue;
+		}
+
+		/* Copy data block from job to result, then compress the block 
+		 * in result.  Finally, send the compressed block back to the 
+		 * worker thread and dispose of the job block (if no compression 
+		 * is used, the job's data_block pointer is reused in the result). */
+		res = calloc(1, sizeof(*res));	
+		_compress_block(
+			job->raw_block,
+			job->raw_block_size, 
+			&res->comp_block,
+			&res->comp_block_size, 
+			job->comp_type,
+			job->comp_level
 		);
-		assert(compression_result == mtbl_res_success);
+		threadq_worker_send_result(wrk, res);
+
+		if (job->comp_type != MTBL_COMPRESSION_NONE)
+			free(job->raw_block);
+		free(job);
 	}
+
+	return NULL;
+}
+
+static void *
+_mtbl_writer_writerthread(void *arg)
+{
+	struct mtbl_writer *w = arg;
+
+	while (true) {
+
+		struct threadq_worker *wrk;
+		struct mtbl_writer_compression_result *res;
+
+		/* Retrieve the next compressed block to be written to disk and 
+		 * place its thread back into the ready queue. */
+		wrk = threadq_next(w->writing_threads);
+		res = threadq_worker_recv_result(wrk);
+		threadq_add(w->ready_threads, wrk);
+
+		// a NULL work result indicates that shutdown has started.
+		if (res == NULL) {
+			break;
+		}
+
+		/* Write block to disk and update mtbl_writer with the total 
+		 * number of bytes written. */
+		size_t bytes;
+		bytes = _write_block(w->fd, res->comp_block, res->comp_block_size);
+		_update_metadata(w, bytes, false);
+
+		free(res->comp_block);
+		free(res);
+	}
+
+	return NULL;
 }
 
 static void
-_mtbl_writer_start_threads(struct mtbl_writer** w) {
+_mtbl_writer_start_threads(struct mtbl_writer* w) {
 	
-	/* Ready thread queue -> All threads waiting to receive work.
-	 * Writing thread queue -> Threads that have been sent work. */
-	(*w)->ready_threads = threadq_init();
-	(*w)->writing_threads = threadq_init();
+	/* Ready thread queue -> Threads waiting to receive work.
+	 * Writing thread queue -> Threads that have been sent work and are 
+	 * 			   either still working or are waiting for their 
+	 * 			   results to be received by the writer thread. */
+	w->ready_threads = threadq_init();
+	w->writing_threads = threadq_init();
 
-	for (size_t i = 0; i < (*w)->opt.thread_count; i++) {
-		struct threadq_worker* wrk = threadq_worker_init(_mtbl_writer_compressionthread);
-		threadq_add((*w)->ready_threads, wrk);
-		(*w)->open_thread_count++;
+	for (size_t i = 0; i < w->opt.thread_count; i++) {
+		struct threadq_worker* wrk;
+		wrk = threadq_worker_init(_mtbl_writer_compressionthread);
+		threadq_add(w->ready_threads, wrk);
+		w->open_thread_count++;
 	}
 	
-	/* The writer thread takes finished work from the writing thread queue 
-	 * and writes it to disk! */
-	pthread_create(&(*w)->writer_thread, NULL, _mtbl_writer_writerthread, *w);
-	pthread_mutex_init(&(*w)->writer_m, NULL);
-	pthread_cond_init(&(*w)->writer_c, NULL);
-	printf("Created %lu compression threads!\n", (*w)->open_thread_count);
+	// The writer thread receives and writes finished data blocks to disk.
+	pthread_create(&w->writer_thread, NULL, _mtbl_writer_writerthread, w);
 }
 
 static void
-_mtbl_writer_shutdown_threads(struct mtbl_writer** w) {
+_mtbl_writer_shutdown_threads(struct mtbl_writer *w) {
 	
 	// Get the next available ready thread and send it the shutdown signal.
-	struct threadq_worker* wrk_shutdown = threadq_next((*w)->ready_threads);
+	struct threadq_worker* wrk_shutdown = threadq_next(w->ready_threads);
 	threadq_worker_send_work(wrk_shutdown, THREADQ_SHUTDOWN);
-	threadq_add((*w)->writing_threads, wrk_shutdown);
+	threadq_add(w->writing_threads, wrk_shutdown);
 
-	pthread_join((*w)->writer_thread, NULL);
-	pthread_mutex_destroy(&(*w)->writer_m);
-	pthread_cond_destroy(&(*w)->writer_c);
+	pthread_join(w->writer_thread, NULL);
 	
-	// Close all ready threads (writing threads will eventually become ready).
-	while ((*w)->open_thread_count > 0) {
-		struct threadq_worker* wrk = threadq_next((*w)->ready_threads);
+	/* Close all ready threads (threads in the writing queue will eventually 
+	 * become ready). */
+	while (w->open_thread_count > 0) {
+		struct threadq_worker* wrk = threadq_next(w->ready_threads);
 		threadq_worker_join(wrk);
 		threadq_worker_destroy(&wrk);
-		(*w)->open_thread_count--;
+		w->open_thread_count--;
 	}
-	threadq_destroy(&((*w)->ready_threads));
-	threadq_destroy(&((*w)->writing_threads));
+
+	threadq_destroy(&(w->ready_threads));
+	threadq_destroy(&(w->writing_threads));
 }
