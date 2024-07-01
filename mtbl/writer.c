@@ -82,26 +82,26 @@ static void _mtbl_writer_writeblock(
 	struct block_builder *,
 	mtbl_compression_type);
 static void _mtbl_writer_writeblock_threads(
-	struct mtbl_writer *w, 
-        struct block_builder *b,
-        mtbl_compression_type compression_type);
+	struct mtbl_writer *, 
+        struct block_builder *,
+        mtbl_compression_type);
 static void _mtbl_writer_writeblock_nothreads(
-	struct mtbl_writer *w, 
-        struct block_builder *b,
-        mtbl_compression_type compression_type);
+	struct mtbl_writer *, 
+        struct block_builder *,
+        mtbl_compression_type);
 
 static void _mtbl_writer_compressblock(
-	uint8_t* src_block,
+	uint8_t *src_block,
 	size_t src_size,
-	uint8_t** dst_block,
-	size_t* dst_size,
-	mtbl_compression_type compression_type,
+	uint8_t **dst_block,
+	size_t *dst_size,
+	mtbl_compression_type,
 	int compression_level);
 
-static void* _mtbl_writer_compressionthread(void* arg);
-static void* _mtbl_writer_writerthread(void* arg);
-static void _mtbl_writer_shutdown_threads(struct mtbl_writer** w);
-static void _mtbl_writer_start_threads(struct mtbl_writer** w);
+static void* _mtbl_writer_compressionthread(void *worker_thread);
+static void* _mtbl_writer_writerthread(void *writer);
+static void _mtbl_writer_shutdown_threads(struct mtbl_writer **);
+static void _mtbl_writer_start_threads(struct mtbl_writer **);
 
 struct mtbl_writer_options *
 mtbl_writer_options_init(void)
@@ -411,7 +411,7 @@ _mtbl_writer_writeblock_threads(struct mtbl_writer *w,
 		job->is_data_block = true;
 	}
 
-	job->compression_type = w->opt.compression_type;
+	job->compression_type = compression_type;
 	job->compression_level = w->opt.compression_level;
 	block_builder_finish(b, &job->raw_data, &job->raw_data_size);
 
